@@ -7,12 +7,14 @@ from openai import OpenAI
 import os
 import hashlib
 import pickle
+import time
+import random
 
 # ---------------------------
 # App Header
 # ---------------------------
-st.title("Jira ↔ TMS Semantic Mapper (Optimized)")
-st.caption("Developed by Pamidi Bala Sumanth – AI-powered with caching")
+st.title("Jira ↔ TMS Semantic Mapper (Safe Batch + Retry)")
+st.caption("Developed by Pamidi Bala Sumanth – AI-powered with caching & retry")
 
 # ---------------------------
 # OpenAI API Key
@@ -89,7 +91,7 @@ def components_from_text(text):
     return ", ".join(sorted(set(comps)))
 
 # ---------------------------
-# Caching helper
+# Caching helpers
 # ---------------------------
 def cache_key(texts, model):
     concat = "|".join(texts)
@@ -108,17 +110,26 @@ def save_cached_embeddings(key, embs):
         pickle.dump(embs, f)
 
 # ---------------------------
-# Batch embedding
+# Safe batch embeddings with retry
 # ---------------------------
-def get_embeddings(texts, model="text-embedding-3-small"):
+def get_embeddings_safe(texts, model="text-embedding-3-small", batch_size=20):
     key = cache_key(texts, model)
     cached = load_cached_embeddings(key)
     if cached is not None:
         return cached
 
-    emb = client.embeddings.create(model=model, input=texts)
-    vectors = [np.array(r.embedding) for r in emb.data]
-
+    vectors = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        success = False
+        while not success:
+            try:
+                emb = client.embeddings.create(model=model, input=batch)
+                vectors.extend([np.array(r.embedding) for r in emb.data])
+                success = True
+            except Exception as e:
+                st.warning(f"⚠️ Rate limit hit on batch {i//batch_size+1}, retrying...")
+                time.sleep(random.uniform(5, 15))  # wait before retry
     save_cached_embeddings(key, vectors)
     return vectors
 
@@ -144,10 +155,10 @@ if jira_file and tms_file and client:
         tms.get("Expected Results","").fillna("").astype(str)
     )
 
-    # Embedding in 2 calls
-    with st.spinner("🔄 Generating embeddings (cached if possible)..."):
-        jira_embs = get_embeddings(jira["__bug_text__"].tolist())
-        tms_embs  = get_embeddings(tms["__full_text__"].tolist())
+    # Embedding with safe batching
+    with st.spinner("🔄 Generating embeddings (safe batched + cached)..."):
+        jira_embs = get_embeddings_safe(jira["__bug_text__"].tolist())
+        tms_embs  = get_embeddings_safe(tms["__full_text__"].tolist())
 
     jira_embs = np.vstack(jira_embs)
     tms_embs = np.vstack(tms_embs)
