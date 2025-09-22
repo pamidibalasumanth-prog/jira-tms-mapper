@@ -35,16 +35,15 @@ def get_embeddings_batched(texts, client, model="text-embedding-3-small", batch_
                 resp = client.embeddings.create(model=model, input=batch)
                 vectors.extend([d.embedding for d in resp.data])
                 success = True
-            except Exception as e:
-                st.warning(f"⚠️ Rate limit or request error on batch {i//batch_size+1}, retrying...")
-                time.sleep(random.uniform(5, 15))  # wait before retry
+            except Exception:
+                time.sleep(random.uniform(5, 15))  # retry wait
     return vectors
 
 # ------------------------
 # Streamlit UI
 # ------------------------
 
-st.title("Jira ↔ TMS Mapper (Batched & Safe)")
+st.title("Jira ↔ TMS Mapper (with New Test Case Creation)")
 st.markdown("**Developed by Pamidi Bala Sumanth**")
 
 api_key = st.text_input("Enter your OpenAI API key", type="password")
@@ -90,29 +89,37 @@ if api_key and jira_file and tms_file:
     # Mapping
     # ------------------------
     best_matches = []
-    alt_matches = []
+    new_cases = []
 
     for i, row in jira.iterrows():
         sim_scores = sims[i]
-        top_idx = np.argsort(sim_scores)[::-1]  # descending
+        top_idx = np.argsort(sim_scores)[::-1]
 
         best_id = None
         best_score = 0
-        candidates = []
 
-        for idx in top_idx[:3]:  # keep top 3
+        for idx in top_idx[:1]:  # only best
             score = sim_scores[idx]
             if score >= threshold:
-                candidates.append(f"{tms[id_col].iloc[idx]} ({score:.2f})")
-                if best_id is None:  # first valid
-                    best_id = tms[id_col].iloc[idx]
-                    best_score = score
+                best_id = tms[id_col].iloc[idx]
+                best_score = score
 
-        best_matches.append(best_id if best_id else "")
-        alt_matches.append(", ".join(candidates))
+        if best_id:
+            best_matches.append(best_id)
+        else:
+            # No match found → mark as needing a new test case
+            best_matches.append("Test case needs to be added – no match found")
+
+            new_cases.append({
+                "Title": row["Summary"],
+                "Description": row.get("Description", row["Summary"]),
+                "Folder": row.get("Component", "Unassigned"),
+                "Priority": row.get("Priority", ""),
+                "Suggested Steps": "Reproduce steps based on bug report",
+                "Source Bug": row["Issue key"]
+            })
 
     jira["TMS ID"] = best_matches
-    jira["Alt Matches"] = alt_matches
 
     # ------------------------
     # Export
@@ -120,10 +127,14 @@ if api_key and jira_file and tms_file:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         jira.to_excel(writer, index=False, sheet_name="Mapped")
+
+        if new_cases:
+            pd.DataFrame(new_cases).to_excel(writer, index=False, sheet_name="New TMS Cases")
+
     processed_data = output.getvalue()
 
-    st.success(f"✅ Mapping complete! {jira['TMS ID'].astype(bool).sum()} of {len(jira)} bugs mapped.")
-    st.dataframe(jira[["Issue key", "Summary", "TMS ID", "Alt Matches"]].head(20))
+    st.success(f"✅ Mapping complete! {jira['TMS ID'].str.contains('Test case needs').sum()} new test cases suggested.")
+    st.dataframe(jira[["Issue key", "Summary", "TMS ID"]].head(20))
 
     st.download_button(
         label="Download Result",
