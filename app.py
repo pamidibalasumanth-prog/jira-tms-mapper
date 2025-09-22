@@ -27,9 +27,17 @@ if jira_file and tms_file:
     else:
         jira = pd.read_excel(jira_file)
 
-    # Load TMS (Test Cases sheet)
-    tms = pd.read_excel(tms_file, sheet_name="Test Cases")
-    tms_cases = tms[["Test Case ID", "Test Case Name"]].dropna()
+    # Load TMS (first sheet = Test Cases usually)
+    tms = pd.read_excel(tms_file, sheet_name=0)
+
+    # Debug: show TMS columns in the UI
+    st.write("🔎 Detected TMS sheet columns:", list(tms.columns))
+
+    # Try to auto-detect ID and Name columns
+    id_col = [c for c in tms.columns if "id" in c.lower()][0]
+    name_col = [c for c in tms.columns if "name" in c.lower()][0]
+
+    tms_cases = tms[[id_col, name_col]].dropna()
 
     # Add new columns to Jira
     jira["TMS ID"] = ""
@@ -49,18 +57,18 @@ if jira_file and tms_file:
         # Fuzzy match
         best_match = process.extractOne(
             bug_summary,
-            tms_cases["Test Case Name"],
+            tms_cases[name_col],
             scorer=fuzz.token_sort_ratio
         )
 
         if best_match:
             match_name, score, idx = best_match
-            if score >= threshold:  # apply slider threshold
-                match_id = tms_cases.iloc[idx]["Test Case ID"]
+            if score >= threshold:
+                match_id = tms_cases.iloc[idx][id_col]
                 jira.at[i, "TMS ID"] = match_id
                 jira.at[i, "Similarity Score"] = score
 
-                # Example: Component mapping rules
+                # Component mapping rules
                 comps = []
                 if "Salesforce" in bug_summary: comps.append("SalesForce")
                 if "SAP" in bug_summary: comps.append("SAP")
@@ -99,6 +107,10 @@ if jira_file and tms_file:
     # Show preview
     st.subheader("Preview of Mapped Data")
     st.dataframe(jira.head(20))
+
+    # Summary count
+    mapped_count = jira["TMS ID"].astype(bool).sum()
+    st.info(f"✅ Successfully mapped {mapped_count} out of {len(jira)} bugs.")
 
     # Export to Excel
     output = BytesIO()
