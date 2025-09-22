@@ -1,229 +1,122 @@
+import os
+import re
 import streamlit as st
 import pandas as pd
-import numpy as np
 from io import BytesIO
-from sklearn.metrics.pairwise import cosine_similarity
 from openai import OpenAI
-import os
-import hashlib
-import pickle
-import time
-import random
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
-# ---------------------------
-# App Header
-# ---------------------------
-st.title("Jira ↔ TMS Semantic Mapper (Safe Batch + Retry)")
-st.caption("Developed by Pamidi Bala Sumanth – AI-powered with caching & retry")
+# ------------------------
+# Helpers
+# ------------------------
 
-# ---------------------------
-# OpenAI API Key
-# ---------------------------
-api_key = st.text_input("Enter your OpenAI API key", type="password")
-if api_key:
-    client = OpenAI(api_key=api_key)
-elif os.getenv("OPENAI_API_KEY"):
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-else:
-    client = None
+def clean_text(text: str) -> str:
+    """Normalize Jira/TMS text for better matching"""
+    if not isinstance(text, str):
+        return ""
+    # remove [Prod], [Request], etc.
+    text = re.sub(r"\[.*?\]", "", text)
+    return text.lower().strip()
 
-# ---------------------------
-# File Uploads
-# ---------------------------
-jira_file = st.file_uploader("Upload Jira C List (CSV/XLSX)", type=["csv", "xlsx"])
-tms_file  = st.file_uploader("Upload TMS Export (Excel)", type=["xlsx"])
-
-# ---------------------------
-# Similarity Threshold
-# ---------------------------
-threshold = st.slider("Select similarity threshold (cosine)", 0.0, 1.0, 0.70, 0.01)
-
-# ---------------------------
-# Platform & Component Mapping
-# ---------------------------
-platform_keywords = {
-    "mobile": "Mobile",
-    "desktop": "Desktop",
-    "api": "API",
-    "salesforce": "Salesforce",
-    "sap": "SAP",
-    "web": "Web"
-}
-
-component_keywords = {
-    "add-on": "Add-Ons",
-    "windows .net": "Windows - .NET",
-    "windows java": "Windows - Java",
-    "user": "User Management",
-    "tunnel": "Tunnel",
-    "test plan": "Test Plans and Runs",
-    "authoring": "Test Authoring",
-    "terminal": "Terminal & Agent",
-    "sap": "SAP",
-    "salesforce": "SalesForce",
-    "recorder": "Recorder (Browser)",
-    "api": "Public APIs",
-    "project": "Projects",
-    "nlp": "NLP",
-    "editor": "Live Editor, Atto Live Editor",
-    "integration": "Integrations",
-    "execution": "Execution",
-    "doc": "Documentation",
-    "co-pilot": "Co-pilot",
-    "billing": "Billing & Licenses",
-    "autonomous": "Autonomous",
-    "heal": "Auto Heal",
-    "atto": "Atto Live Editor, Atto Generator, Atto Analyzer",
-    "ai": "AI Research"
-}
-
-def platform_from_text(text):
-    for kw, plat in platform_keywords.items():
-        if kw in text.lower():
-            return plat
-    return ""
-
-def components_from_text(text):
-    comps = []
-    for kw, comp in component_keywords.items():
-        if kw in text.lower():
-            comps.extend([c.strip() for c in comp.split(",")])
-    return ", ".join(sorted(set(comps)))
-
-# ---------------------------
-# Caching helpers
-# ---------------------------
-def cache_key(texts, model):
-    concat = "|".join(texts)
-    return hashlib.md5((concat + model).encode("utf-8")).hexdigest()
-
-def load_cached_embeddings(key):
-    fname = f"cache_{key}.pkl"
-    if os.path.exists(fname):
-        with open(fname, "rb") as f:
-            return pickle.load(f)
-    return None
-
-def save_cached_embeddings(key, embs):
-    fname = f"cache_{key}.pkl"
-    with open(fname, "wb") as f:
-        pickle.dump(embs, f)
-
-# ---------------------------
-# Safe batch embeddings with retry
-# ---------------------------
-def get_embeddings_safe(texts, model="text-embedding-3-small", batch_size=20):
-    key = cache_key(texts, model)
-    cached = load_cached_embeddings(key)
-    if cached is not None:
-        return cached
-
-    vectors = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        success = False
-        while not success:
-            try:
-                emb = client.embeddings.create(model=model, input=batch)
-                vectors.extend([np.array(r.embedding) for r in emb.data])
-                success = True
-            except Exception as e:
-                st.warning(f"⚠️ Rate limit hit on batch {i//batch_size+1}, retrying...")
-                time.sleep(random.uniform(5, 15))  # wait before retry
-    save_cached_embeddings(key, vectors)
-    return vectors
-
-# ---------------------------
-# Main
-# ---------------------------
-if jira_file and tms_file and client:
-    # Load Jira
-    jira = pd.read_csv(jira_file) if jira_file.name.endswith(".csv") else pd.read_excel(jira_file)
-    jira["__bug_text__"] = (jira.get("Summary","").fillna("").astype(str) + " " +
-                            jira.get("Description","").fillna("").astype(str))
-
-    # Load TMS
-    try:
-        tms = pd.read_excel(tms_file, sheet_name="Test Cases")
-    except Exception:
-        tms = pd.read_excel(tms_file)
-
-    tms["__full_text__"] = (
-        tms.get("Title","").fillna("").astype(str) + " " +
-        tms.get("Description","").fillna("").astype(str) + " " +
-        tms.get("Steps","").fillna("").astype(str) + " " +
-        tms.get("Expected Results","").fillna("").astype(str)
+def get_embeddings(texts, client, model="text-embedding-3-small"):
+    """Batch embeddings with OpenAI"""
+    if not texts:
+        return []
+    response = client.embeddings.create(
+        model=model,
+        input=texts
     )
+    return [d.embedding for d in response.data]
 
-    # Embedding with safe batching
-    with st.spinner("🔄 Generating embeddings (safe batched + cached)..."):
-        jira_embs = get_embeddings_safe(jira["__bug_text__"].tolist())
-        tms_embs  = get_embeddings_safe(tms["__full_text__"].tolist())
+# ------------------------
+# Streamlit UI
+# ------------------------
 
-    jira_embs = np.vstack(jira_embs)
-    tms_embs = np.vstack(tms_embs)
+st.title("Jira ↔ TMS Mapper")
+st.markdown("**Developed by Pamidi Bala Sumanth**")
 
-    # Similarity
-    sim_matrix = cosine_similarity(jira_embs, tms_embs)
+api_key = st.text_input("Enter your OpenAI API key", type="password")
 
-    # One-to-one greedy assignment
-    assigned_bug, assigned_tms, chosen = set(), set(), {}
-    edges = []
-    for i in range(sim_matrix.shape[0]):
-        for j in range(sim_matrix.shape[1]):
-            score = sim_matrix[i, j]
+jira_file = st.file_uploader("Upload Jira C List (CSV/XLSX)", type=["csv", "xlsx"])
+tms_file = st.file_uploader("Upload TMS Export (Excel)", type=["xlsx"])
+threshold = st.slider("Select similarity threshold (cosine)", 0.0, 1.0, 0.5, 0.05)
+
+if api_key and jira_file and tms_file:
+    client = OpenAI(api_key=api_key)
+
+    # ------------------------
+    # Load Data
+    # ------------------------
+    if jira_file.name.endswith(".csv"):
+        jira = pd.read_csv(jira_file)
+    else:
+        jira = pd.read_excel(jira_file)
+
+    tms = pd.read_excel(tms_file, sheet_name=0)
+
+    # Flexible detection of TMS columns
+    id_col = [c for c in tms.columns if "id" in c.lower()][0]
+    title_col = [c for c in tms.columns if "title" in c.lower()][0]
+
+    # Clean fields
+    jira["__bug_text__"] = jira["Summary"].apply(clean_text)
+    tms["__case_text__"] = tms[title_col].apply(clean_text)
+
+    # ------------------------
+    # Embeddings
+    # ------------------------
+    with st.spinner("🔎 Generating embeddings for Jira and TMS cases..."):
+        jira_embs = get_embeddings(jira["__bug_text__"].tolist(), client)
+        tms_embs = get_embeddings(tms["__case_text__"].tolist(), client)
+
+    jira_matrix = np.array(jira_embs)
+    tms_matrix = np.array(tms_embs)
+
+    sims = cosine_similarity(jira_matrix, tms_matrix)
+
+    # ------------------------
+    # Mapping
+    # ------------------------
+    best_matches = []
+    alt_matches = []
+
+    for i, row in jira.iterrows():
+        sim_scores = sims[i]
+        top_idx = np.argsort(sim_scores)[::-1]  # descending
+
+        best_id = None
+        best_score = 0
+        candidates = []
+
+        for idx in top_idx[:3]:  # keep top 3
+            score = sim_scores[idx]
             if score >= threshold:
-                edges.append((score, i, j))
-    edges.sort(reverse=True)
+                candidates.append(f"{tms[id_col].iloc[idx]} ({score:.2f})")
+                if best_id is None:  # first valid
+                    best_id = tms[id_col].iloc[idx]
+                    best_score = score
 
-    for score, b_idx, t_idx in edges:
-        if b_idx in assigned_bug or t_idx in assigned_tms:
-            continue
-        assigned_bug.add(b_idx)
-        assigned_tms.add(t_idx)
-        chosen[b_idx] = (t_idx, score)
+        best_matches.append(best_id if best_id else "")
+        alt_matches.append(", ".join(candidates))
 
-    # Fill output
-    jira["TMS ID"] = ""
-    jira["Similarity Score"] = 0.0
-    jira["Platform"] = ""
-    jira["Component"] = ""
-    jira["TMS Folder Name"] = ""
-    jira["Priority Changed"] = ""
+    jira["TMS ID"] = best_matches
+    jira["Alt Matches"] = alt_matches
 
-    for b_idx in range(len(jira)):
-        text = jira.at[b_idx, "__bug_text__"]
-        jira.at[b_idx, "Platform"] = platform_from_text(text)
-        jira.at[b_idx, "Component"] = components_from_text(text)
-
-        if b_idx in chosen:
-            t_idx, score = chosen[b_idx]
-            jira.at[b_idx, "TMS ID"] = tms.at[t_idx, "ID"]
-            jira.at[b_idx, "Similarity Score"] = score
-            if "Folder" in tms.columns:
-                jira.at[b_idx, "TMS Folder Name"] = tms.at[t_idx, "Folder"]
-
+    # ------------------------
     # Export
-    desired_order = [
-        "Issue Type", "Issue key", "Summary", "Assignee", "Reporter",
-        "Priority", "Status", "Review Assignee", "Review Comments",
-        "TMS ID", "Component", "Platform", "TMS Folder Name",
-        "Priority Changed", "Similarity Score"
-    ]
-    output_df = jira[[c for c in desired_order if c in jira.columns]].copy()
+    # ------------------------
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        jira.to_excel(writer, index=False, sheet_name="Mapped")
+    processed_data = output.getvalue()
 
-    st.success("✅ Semantic mapping complete!")
-    st.info(f"Mapped {output_df['TMS ID'].astype(bool).sum()} out of {len(output_df)} bugs")
+    st.success(f"✅ Mapping complete! {jira['TMS ID'].astype(bool).sum()} of {len(jira)} bugs mapped.")
+    st.dataframe(jira[["Issue key", "Summary", "TMS ID", "Alt Matches"]].head(20))
 
-    st.subheader("Preview of Mapped Data")
-    st.dataframe(output_df.head(50), use_container_width=True)
-
-    outbuf = BytesIO()
-    with pd.ExcelWriter(outbuf, engine="xlsxwriter") as writer:
-        output_df.to_excel(writer, index=False, sheet_name="Mapped")
     st.download_button(
-        "📥 Download Result",
-        outbuf.getvalue(),
-        file_name="Jira_C_List_TMS_Semantic.xlsx",
+        label="Download Result",
+        data=processed_data,
+        file_name="Jira_C_List_TMS_Final.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
