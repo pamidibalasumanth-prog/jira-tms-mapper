@@ -1,7 +1,7 @@
 streamlit
 pandas
+numpy
+scikit-learn
+rapidfuzz
 openpyxl
 xlsxwriter
-rapidfuzz
-openai
-scikit-learn
