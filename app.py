@@ -1,5 +1,7 @@
 import os
 import re
+import time
+import random
 import streamlit as st
 import pandas as pd
 from io import BytesIO
@@ -19,21 +21,30 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\[.*?\]", "", text)
     return text.lower().strip()
 
-def get_embeddings(texts, client, model="text-embedding-3-small"):
-    """Batch embeddings with OpenAI"""
-    if not texts:
-        return []
-    response = client.embeddings.create(
-        model=model,
-        input=texts
-    )
-    return [d.embedding for d in response.data]
+def get_embeddings_batched(texts, client, model="text-embedding-3-small", batch_size=100):
+    """Get embeddings in safe batches with retry and backoff"""
+    vectors = []
+    for i in range(0, len(texts), batch_size):
+        batch = [t for t in texts[i:i+batch_size] if isinstance(t, str) and t.strip()]
+        if not batch:
+            continue
+
+        success = False
+        while not success:
+            try:
+                resp = client.embeddings.create(model=model, input=batch)
+                vectors.extend([d.embedding for d in resp.data])
+                success = True
+            except Exception as e:
+                st.warning(f"⚠️ Rate limit or request error on batch {i//batch_size+1}, retrying...")
+                time.sleep(random.uniform(5, 15))  # wait before retry
+    return vectors
 
 # ------------------------
 # Streamlit UI
 # ------------------------
 
-st.title("Jira ↔ TMS Mapper")
+st.title("Jira ↔ TMS Mapper (Batched & Safe)")
 st.markdown("**Developed by Pamidi Bala Sumanth**")
 
 api_key = st.text_input("Enter your OpenAI API key", type="password")
@@ -66,9 +77,9 @@ if api_key and jira_file and tms_file:
     # ------------------------
     # Embeddings
     # ------------------------
-    with st.spinner("🔎 Generating embeddings for Jira and TMS cases..."):
-        jira_embs = get_embeddings(jira["__bug_text__"].tolist(), client)
-        tms_embs = get_embeddings(tms["__case_text__"].tolist(), client)
+    with st.spinner("🔎 Generating embeddings for Jira and TMS cases in batches..."):
+        jira_embs = get_embeddings_batched(jira["__bug_text__"].tolist(), client)
+        tms_embs = get_embeddings_batched(tms["__case_text__"].tolist(), client)
 
     jira_matrix = np.array(jira_embs)
     tms_matrix = np.array(tms_embs)
