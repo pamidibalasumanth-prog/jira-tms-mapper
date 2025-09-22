@@ -31,7 +31,15 @@ if jira_file and tms_file:
     tms = pd.read_excel(tms_file)
     id_col = "ID"
     name_col = "Title"
-    tms_cases = tms[[id_col, name_col]].dropna()
+
+    # Combine TMS text for richer matching
+    tms["full_text"] = (
+        tms[name_col].fillna("").astype(str) + " " +
+        tms.get("Description", "").fillna("").astype(str) + " " +
+        tms.get("Steps", "").fillna("").astype(str) + " " +
+        tms.get("Expected Results", "").fillna("").astype(str)
+    )
+    tms_cases = tms[[id_col, name_col, "full_text"]].dropna()
 
     # Add new columns
     jira["TMS ID"] = ""
@@ -46,14 +54,16 @@ if jira_file and tms_file:
     progress_bar = st.progress(0, text=progress_text)
 
     total = len(jira)
-    for i, summary in enumerate(jira["Summary"].fillna("")):
-        if not summary.strip():
+    for i, row in jira.iterrows():
+        jira_text = f"{row.get('Summary','')} {row.get('Description','')}".strip()
+
+        if not jira_text:
             continue
 
-        # --- Fuzzy matching ---
+        # --- Fuzzy matching (Summary+Description vs TMS full text) ---
         match = process.extractOne(
-            summary,
-            tms_cases[name_col],
+            jira_text,
+            tms_cases["full_text"],
             score_cutoff=threshold
         )
 
@@ -62,10 +72,8 @@ if jira_file and tms_file:
             jira.at[i, "TMS ID"] = tms_cases.iloc[idx][id_col]
             jira.at[i, "Similarity Score"] = score
 
-        # --- Platform & Component Mapping ---
-        text = f"{summary} {jira.at[i,'Description'] if 'Description' in jira.columns else ''}".lower()
-
-        # Platform (only one, first match wins)
+        # --- Platform Mapping (first match wins) ---
+        text = jira_text.lower()
         platform_keywords = {
             "mobile": "Mobile",
             "desktop": "Desktop",
@@ -79,7 +87,7 @@ if jira_file and tms_file:
                 jira.at[i, "Platform"] = plat
                 break
 
-        # Components (multiple, comma-separated)
+        # --- Component Mapping (multiple allowed) ---
         component_keywords = {
             "add-on": "Add-Ons",
             "windows .net": "Windows - .NET",
