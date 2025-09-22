@@ -1,124 +1,125 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 from io import BytesIO
-from rapidfuzz import process, fuzz
+from rapidfuzz import fuzz
+from openai import OpenAI
 
+# -------------------------------
+# Streamlit Page Setup
+# -------------------------------
 st.set_page_config(page_title="Jira ↔ TMS Mapper", layout="wide")
-
 st.title("Jira ↔ TMS Mapper")
 st.caption("Developed by Pamidi Bala Sumanth")
 
-# File uploads
+# -------------------------------
+# Step 1: Enter OpenAI API Key
+# -------------------------------
+api_key = st.text_input("Enter your OpenAI API key", type="password")
+
+if api_key:
+    client = OpenAI(api_key=api_key)
+else:
+    st.warning("⚠️ Please enter your OpenAI API key above to continue.")
+    st.stop()
+
+# -------------------------------
+# File Uploads
+# -------------------------------
 jira_file = st.file_uploader("Upload Jira C List (CSV/XLSX)", type=["csv", "xlsx"])
 tms_file = st.file_uploader("Upload TMS Export (Excel)", type=["xlsx"])
+threshold = st.slider("Select similarity threshold (cosine/ratio)", 0.0, 1.0, 0.60, 0.01)
 
-similarity_threshold = st.slider(
-    "Select similarity threshold (cosine/ratio)",
-    0.1, 1.0, 0.6, 0.01
-)
+# -------------------------------
+# Helper Functions
+# -------------------------------
+def get_embeddings(texts, client, model="text-embedding-3-small"):
+    embeddings = []
+    for txt in texts:
+        try:
+            response = client.embeddings.create(model=model, input=txt)
+            embeddings.append(response.data[0].embedding)
+        except Exception as e:
+            st.error(f"Embedding error: {e}")
+            embeddings.append([0.0] * 1536)
+    return embeddings
 
+
+def cosine_similarity(vec1, vec2):
+    import numpy as np
+    v1, v2 = np.array(vec1), np.array(vec2)
+    return float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-10))
+
+# -------------------------------
+# Processing Logic
+# -------------------------------
 if jira_file and tms_file:
-    # Load Jira file
+    # Load Jira
     if jira_file.name.endswith(".csv"):
         jira = pd.read_csv(jira_file)
     else:
         jira = pd.read_excel(jira_file)
 
-    # Load TMS export
-    tms = pd.read_excel(tms_file, sheet_name=0)
+    # Load TMS
+    tms = pd.read_excel(tms_file)
 
-    # Normalize Jira text
-    jira["__bug_text__"] = jira["Summary"].fillna("") + " " + jira["Description"].fillna("")
+    # Normalize text fields
+    jira["__bug_text__"] = jira["Summary"].fillna("")
+    tms["__case_text__"] = tms["Title"].fillna("") + " " + tms["Description"].fillna("")
 
-    # Normalize TMS text
-    name_col = [c for c in tms.columns if "title" in c.lower() or "name" in c.lower()]
-    desc_col = [c for c in tms.columns if "desc" in c.lower()]
-    tms["__case_text__"] = (
-        tms[name_col[0]].fillna("").astype(str)
-        + " " +
-        (tms[desc_col[0]].fillna("").astype(str) if desc_col else "")
-    )
+    # Generate embeddings
+    st.info("⏳ Generating embeddings... this may take some time for large files.")
+    jira_embs = get_embeddings(jira["__bug_text__"].tolist(), client)
+    tms_embs = get_embeddings(tms["__case_text__"].tolist(), client)
 
-    # Prepare result storage
-    mappings = []
+    # Perform matching
+    mapped_rows = []
+    for i, bug in jira.iterrows():
+        bug_emb = jira_embs[i]
+        best_score = -1
+        best_case = None
 
-    progress = st.progress(0, text="🔄 Mapping Jira bugs to TMS test cases...")
+        for j, case in tms.iterrows():
+            score = cosine_similarity(bug_emb, tms_embs[j])
+            if score > best_score:
+                best_score = score
+                best_case = case
 
-    # Iterate over Jira bugs
-    for idx, row in enumerate(jira.itertuples(index=False)):
-        bug_text = str(row.Summary) + " " + str(getattr(row, "Description", ""))
-        bug_text = bug_text.strip()
-
-        if not bug_text:
-            mappings.append({
-                "Issue key": row._asdict().get("Issue key", ""),
-                "Summary": row.Summary,
-                "TMS ID": "⚠️ No bug text",
-                "Similarity Score": 0,
-                "Component": "",
-                "Platform": "",
-                "TMS Folder Name": "Test case needs to be added"
-            })
-            continue
-
-        # Match with TMS
-        best_match = process.extractOne(
-            bug_text,
-            tms["__case_text__"].tolist(),
-            scorer=fuzz.token_set_ratio
-        )
-
-        if best_match and best_match[1] / 100 >= similarity_threshold:
-            case_idx = tms["__case_text__"].tolist().index(best_match[0])
-            case_row = tms.iloc[case_idx]
-
-            mappings.append({
-                "Issue key": row._asdict().get("Issue key", ""),
-                "Summary": row.Summary,
-                "TMS ID": case_row.get("ID", ""),
-                "Similarity Score": round(best_match[1] / 100, 4),
-                "Component": row._asdict().get("Component", ""),
-                "Platform": row._asdict().get("Platform", ""),
-                "TMS Folder Name": case_row.get("Folder", "")
+        if best_score >= threshold:
+            mapped_rows.append({
+                **bug.to_dict(),
+                "TMS ID": best_case["ID"],
+                "Component": best_case.get("Labels", ""),
+                "Platform": "Web",  # Hardcoded fallback
+                "TMS Folder Name": best_case.get("Folder", ""),
+                "Similarity Score": round(best_score, 4)
             })
         else:
-            mappings.append({
-                "Issue key": row._asdict().get("Issue key", ""),
-                "Summary": row.Summary,
-                "TMS ID": "❌ No match found",
-                "Similarity Score": 0,
-                "Component": row._asdict().get("Component", ""),
-                "Platform": row._asdict().get("Platform", ""),
-                "TMS Folder Name": "Test case needs to be added"
+            mapped_rows.append({
+                **bug.to_dict(),
+                "TMS ID": "❌ No match found – New test case required",
+                "Component": "",
+                "Platform": "",
+                "TMS Folder Name": "",
+                "Similarity Score": round(best_score, 4)
             })
 
-        progress.progress((idx + 1) / len(jira),
-                          text=f"Processed {idx+1}/{len(jira)} Jira bugs")
+    result_df = pd.DataFrame(mapped_rows)
 
-    progress.empty()
+    # -------------------------------
+    # Preview in Streamlit
+    # -------------------------------
+    st.success(f"✅ Complete: {len(result_df)} bugs processed.")
+    st.dataframe(result_df, use_container_width=True)
 
-    # Final DataFrame
-    mapped = pd.DataFrame(mappings)
-
-    # Status
-    matched_count = (mapped["TMS ID"] != "❌ No match found").sum()
-    new_needed = (mapped["TMS ID"] == "❌ No match found").sum()
-
-    st.success(f"✅ Complete: {matched_count}/{len(mapped)} mapped to existing TMS. {new_needed} need new test cases.")
-
-    # Show ALL rows in preview
-    st.write(mapped.to_html(escape=False, index=False), unsafe_allow_html=True)
-
-    # ✅ Export to Excel in memory
+    # -------------------------------
+    # Download as Excel
+    # -------------------------------
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        mapped.to_excel(writer, index=False, sheet_name="Mapped")
-    processed_data = output.getvalue()
-
+        result_df.to_excel(writer, index=False, sheet_name="Mapped")
     st.download_button(
-        label="⬇️ Download Excel",
-        data=processed_data,
+        "📥 Download Excel",
+        data=output.getvalue(),
         file_name="Jira_C_List_TMS_Final.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
