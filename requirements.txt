@@ -3,4 +3,5 @@ pandas
 openpyxl
 xlsxwriter
 rapidfuzz
-pyarrow
+openai
+scikit-learn
