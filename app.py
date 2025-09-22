@@ -1,50 +1,37 @@
-import os
 import re
 import time
-import hashlib
-import random
 import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
-from openai import OpenAI
-from sklearn.metrics.pairwise import cosine_similarity
 from rapidfuzz import fuzz, process
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-# =========================
-# Streamlit Setup
-# =========================
-st.set_page_config(page_title="Jira ↔ TMS Mapper", page_icon="🧭", layout="wide")
+# =====================================
+# Streamlit UI
+# =====================================
+st.set_page_config(page_title="Jira ↔ TMS Mapper (Deterministic, Fast)", page_icon="🧭", layout="wide")
 st.title("Jira ↔ TMS Mapper")
-st.caption("Developed by Pamidi Bala Sumanth • precise mapping + auto-fallback")
+st.caption("Deterministic multi-stage matching • No API calls • Precise & fast")
 
-# =========================
-# Controls
-# =========================
-api_key = st.text_input("🔑 OpenAI API key", type="password")
 jira_file = st.file_uploader("📂 Upload Jira C List (CSV/XLSX)", type=["csv", "xlsx"])
 tms_file  = st.file_uploader("📂 Upload TMS Export (Excel)", type=["xlsx"])
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    sim_threshold = st.slider("Similarity threshold", 0.0, 1.0, 0.60, 0.01,
-                              help="Higher = stricter (fewer matches), Lower = looser (more matches)")
-with col2:
-    candidate_cap = st.number_input("Candidate pool per bug (after filtering)", 50, 1000, 300, step=50,
-                                    help="We only compare against this many likely TMS cases per bug")
-with col3:
-    alpha = st.slider("Semantic vs Fuzzy weight (α)", 0.0, 1.0, 0.80, 0.05,
-                      help="α=1 uses only embeddings; α=0 uses only fuzzy string match")
+colA, colB, colC = st.columns(3)
+with colA:
+    fuzzy_threshold = st.slider("Fuzzy threshold", 50, 100, 82, 1,
+                                help="Min RapidFuzz token_set_ratio to accept fuzzy match (0-100)")
+with colB:
+    tfidf_threshold = st.slider("TF-IDF cosine threshold", 0.0, 1.0, 0.22, 0.01,
+                                help="Min cosine similarity (TF-IDF) for acceptance")
+with colC:
+    max_candidates = st.number_input("Max candidate pool size", min_value=50, max_value=2000, value=400, step=50,
+                                     help="We restrict matching to this many likely TMS cases per bug")
 
-if not api_key:
-    st.info("Enter API key to begin.")
-    st.stop()
-
-client = OpenAI(api_key=api_key)
-
-# =========================
-# Hardcoded rules (Platform = single; Component = multi)
-# =========================
+# =====================================
+# Rules (Platform = single; Components = multi)
+# =====================================
 PLATFORM_RULES = [
     ("salesforce", "Salesforce"),
     ("sap",        "SAP"),
@@ -103,13 +90,12 @@ COMPONENT_RULES = {
     "java": "Windows - Java",     # heuristic
 }
 
-# =========================
+# =====================================
 # Helpers
-# =========================
+# =====================================
 def clean_text(s: str) -> str:
-    if not isinstance(s, str):
-        return ""
-    s = re.sub(r"\[.*?\]", " ", s)  # remove [Prod], [Request], ...
+    if not isinstance(s, str): return ""
+    s = re.sub(r"\[.*?\]", " ", s)        # remove [tags]
     s = re.sub(r"\s+", " ", s)
     return s.strip().lower()
 
@@ -128,71 +114,58 @@ def components_from_text(text: str) -> str:
             comps.append(comp)
     return ", ".join(sorted(set(comps))) if comps else ""
 
-def extract_tags(text: str) -> set:
-    t = text.lower()
-    keys = [
-        "salesforce","sap","recorder","api","terminal","agent","integration",
-        "billing","license","nlp","tunnel","execution","editor","project",
-        "authoring","test plan","co-pilot","documentation","autonomous","heal",
-        "atto","ai","windows","java","mobile","android","ios","desktop","web","browser"
-    ]
-    return {k for k in keys if k in t}
+def extract_issue_keys(text: str) -> set:
+    """Find Jira-like keys ABC-123 in a text field if present."""
+    if not isinstance(text, str): return set()
+    return set(re.findall(r"\b[A-Z][A-Z0-9]+-\d+\b", text))
 
-def hash_series_text(series: pd.Series) -> str:
-    m = hashlib.md5()
-    for v in series.values:
-        m.update(str(v).encode("utf-8", errors="ignore"))
-        m.update(b"|")
-    return m.hexdigest()
+def shortlist_candidates_for_bug(bug_text: str, tms_df: pd.DataFrame, cap: int) -> pd.Index:
+    """
+    Narrow TMS to likely matches using:
+      - Folder/Labels keyword overlap from bug
+      - Fuzzy against Title to rank
+    """
+    # quick keyword tags from bug text
+    tags = set()
+    for k in ["salesforce","sap","recorder","api","terminal","agent","integration",
+              "billing","license","nlp","tunnel","execution","editor","project",
+              "authoring","test plan","co-pilot","documentation","autonomous","heal",
+              "atto","ai","windows","java","mobile","android","ios","desktop","web","browser"]:
+        if k in bug_text:
+            tags.add(k)
 
-@st.cache_data(show_spinner=False)
-def embed_texts_cached(texts: list, model="text-embedding-3-small", batch_size=100):
-    """Return np.ndarray of shape (N, 1536). Cached by content hash."""
-    content_key = hashlib.md5("|".join(texts).encode("utf-8", errors="ignore")).hexdigest()
-    # return cached value if exists
-    cached = st.session_state.get(f"emb_{content_key}")
-    if cached is not None:
-        return cached
+    # filter by Folder/Labels if tags exist
+    filt = tms_df.index
+    if tags:
+        mask = tms_df["__folder_labels__"].str.contains("|".join([re.escape(t) for t in tags]), case=False, na=False)
+        sub = tms_df[mask]
+        if len(sub) >= 1:
+            filt = sub.index
 
-    vectors = []
-    prog = st.progress(0.0, text="🔎 Embedding texts (batched)…")
-    total = len(texts)
-    for i in range(0, total, batch_size):
-        batch = texts[i:i+batch_size]
-        # replace empties with short placeholder to keep alignment
-        safe_batch = [b if isinstance(b, str) and b.strip() else " " for b in batch]
-        success = False
-        while not success:
-            try:
-                resp = client.embeddings.create(model=model, input=safe_batch)
-                vectors.extend([np.array(d.embedding, dtype=np.float32) for d in resp.data])
-                success = True
-            except Exception:
-                time.sleep(random.uniform(4, 10))
-        prog.progress(min(0.999, (i+batch_size)/max(1,total)))
-    prog.progress(1.0, text="✅ Embeddings ready")
-    out = np.vstack(vectors)
-    st.session_state[f"emb_{content_key}"] = out
-    return out
+    # still too large? rank by fuzzy on Title to cap
+    if len(filt) > cap:
+        choices = tms_df.loc[filt, "__title__"].tolist()
+        ranked = process.extract(bug_text, choices, scorer=fuzz.token_set_ratio, limit=cap)
+        sel_idxs = [filt[idx] for _,_,idx in ranked]
+        return pd.Index(sel_idxs)
 
-def hybrid_score(btxt: str, ctxt: str, bvec: np.ndarray, cvec: np.ndarray, alpha: float) -> float:
-    # semantic
-    cos = float(np.dot(bvec, cvec) / (np.linalg.norm(bvec) * np.linalg.norm(cvec) + 1e-9))
-    # literal
-    fuzz_score = fuzz.token_set_ratio(btxt, ctxt) / 100.0
-    return alpha * cos + (1.0 - alpha) * fuzz_score
+    return pd.Index(filt)
 
-# =========================
+# =====================================
 # Main
-# =========================
+# =====================================
 if jira_file and tms_file:
     # ---- Load Jira
     jira = pd.read_csv(jira_file) if jira_file.name.endswith(".csv") else pd.read_excel(jira_file)
-    if "Summary" not in jira.columns or "Issue key" not in jira.columns:
-        st.error("Jira file must include 'Issue key' and 'Summary' columns.")
-        st.stop()
-    jira["__bug_text__"] = (jira["Summary"].fillna("") + " " + jira.get("Description", "").fillna("")).apply(clean_text)
-    jira["__tags__"] = jira["__bug_text__"].apply(extract_tags)
+    needed_cols = ["Issue key", "Summary"]
+    for c in needed_cols:
+        if c not in jira.columns:
+            st.error(f"Jira file must include '{c}' column.")
+            st.stop()
+
+    jira["_summary_"] = jira["Summary"].fillna("").astype(str)
+    jira["_desc_"]    = jira.get("Description", "").fillna("").astype(str)
+    jira["__bug_text__"] = (jira["_summary_"] + " " + jira["_desc_"]).apply(clean_text)
 
     # ---- Load TMS
     try:
@@ -200,144 +173,170 @@ if jira_file and tms_file:
     except Exception:
         tms = pd.read_excel(tms_file, sheet_name=0)
 
-    # detect columns
-    try:
-        tms_id_col = [c for c in tms.columns if "id" in c.lower()][0]
-    except IndexError:
-        st.error("Could not find a TMS ID column. Ensure your TMS sheet has an 'ID' column.")
+    # Detect important columns
+    # ID
+    id_candidates = [c for c in tms.columns if c.strip().lower() in ("id","tms id","test id","case id")]
+    if not id_candidates:
+        id_candidates = [c for c in tms.columns if "id" in c.lower()]
+    if not id_candidates:
+        st.error("Could not find a TMS ID column. Ensure your TMS sheet includes an 'ID' column.")
         st.stop()
-    try:
-        tms_title_col = [c for c in tms.columns if "title" in c.lower()][0]
-    except IndexError:
-        st.error("Could not find a TMS Title column. Ensure your TMS sheet has a 'Title' column.")
-        st.stop()
+    TMS_ID = id_candidates[0]
 
-    # Build text + tags for TMS
+    # Title
+    title_candidates = [c for c in tms.columns if c.strip().lower() in ("title","name")]
+    if not title_candidates:
+        title_candidates = [c for c in tms.columns if "title" in c.lower() or "name" in c.lower()]
+    if not title_candidates:
+        st.error("Could not find a TMS Title/Name column.")
+        st.stop()
+    TMS_TITLE = title_candidates[0]
+
+    # Optional helper columns
+    TMS_DESC  = "Description" if "Description" in tms.columns else None
+    TMS_STEPS = "Steps" if "Steps" in tms.columns else None
+    TMS_EXP   = "Expected Results" if "Expected Results" in tms.columns else None
+    TMS_FOLDER= "Folder" if "Folder" in tms.columns else None
+    TMS_LABEL = "Labels" if "Labels" in tms.columns else None
+    TMS_JIRA  = None
+    for c in tms.columns:
+        if "jira" in c.lower() and "id" in c.lower():
+            TMS_JIRA = c
+            break
+
+    # Precompute normalized fields
+    tms["__title__"] = tms[TMS_TITLE].fillna("").astype(str)
+    tms["__desc__"]  = tms[TMS_DESC ].fillna("").astype(str) if TMS_DESC  else ""
+    tms["__steps__"] = tms[TMS_STEPS].fillna("").astype(str) if TMS_STEPS else ""
+    tms["__exp__"]   = tms[TMS_EXP  ].fillna("").astype(str) if TMS_EXP   else ""
+    tms["__folder__"]= tms[TMS_FOLDER].fillna("").astype(str) if TMS_FOLDER else ""
+    tms["__labels__"]= tms[TMS_LABEL ].fillna("").astype(str) if TMS_LABEL  else ""
+    tms["__folder_labels__"] = (tms["__folder__"] + " " + tms["__labels__"]).str.lower()
+
+    # For matching, build a compact text
     tms["__full_text__"] = (
-        tms[tms_title_col].fillna("").astype(str) + " " +
-        tms.get("Description", "").fillna("").astype(str) + " " +
-        tms.get("Steps", "").fillna("").astype(str) + " " +
-        tms.get("Expected Results", "").fillna("").astype(str) + " " +
-        tms.get("Folder", "").fillna("").astype(str) + " " +
-        tms.get("Labels", "").fillna("").astype(str)
+        tms["__title__"] + " " + tms["__desc__"] + " " + tms["__steps__"] + " " + tms["__exp__"]
     ).apply(clean_text)
-    tms["__tags__"] = tms["__full_text__"].apply(extract_tags)
 
-    # ---- Embeddings (with caching)
-    st.info("⏳ Embedding TMS cases (cached by file content)…")
-    tms_emb = embed_texts_cached(tms["__full_text__"].tolist(), model="text-embedding-3-small", batch_size=100)
-    st.info("⏳ Embedding Jira bugs…")
-    jira_emb = embed_texts_cached(jira["__bug_text__"].tolist(), model="text-embedding-3-small", batch_size=100)
+    # Build quick map from Jira Ticket IDs present in TMS (ground truth)
+    tms_issuekey_to_ids = {}
+    if TMS_JIRA:
+        for i, val in tms[TMS_JIRA].fillna("").astype(str).items():
+            keys = extract_issue_keys(val)
+            for k in keys:
+                tms_issuekey_to_ids.setdefault(k, []).append(i)  # store row index
 
-    # ---- Candidate generation per bug (domain filter → fuzzy shortlist → cap)
-    progress_candidates = st.progress(0.0, text="🔍 Selecting candidates…")
-    candidates_per_bug = []
-    for i, row in jira.iterrows():
-        bug_tags = row["__tags__"]
-        # domain filter: prefer TMS rows sharing tags
-        mask = (tms["__tags__"].apply(lambda s: len(s & bug_tags) > 0))
-        idxs = list(tms.index[mask])
-        if not idxs:
-            # fallback: fuzzy shortlist by Title only (fast)
-            choices = tms[tms_title_col].fillna("").tolist()
-            picks = process.extract(row["__bug_text__"], choices, scorer=fuzz.token_set_ratio, limit=min(candidate_cap, len(choices)))
-            idxs = [p[2] for p in picks]  # indices into choices; matches tms rows order
-        else:
-            # if still big, cap by fuzzy on full_text
-            if len(idxs) > candidate_cap:
-                subset = tms["__full_text__"].iloc[idxs].tolist()
-                picks = process.extract(row["__bug_text__"], subset, scorer=fuzz.token_set_ratio, limit=candidate_cap)
-                idxs = [idxs[p[2]] for p in picks]
-        candidates_per_bug.append(idxs)
-        progress_candidates.progress((i+1)/len(jira), text=f"🔍 Selecting candidates… {i+1}/{len(jira)}")
-    progress_candidates.empty()
+    # ---- Matching
+    progress = st.progress(0.0, text="🔎 Mapping bugs to TMS…")
+    results = []
 
-    # ---- Score edges for global one-to-one
-    st.info("⚖️ Scoring candidates & enforcing one-to-one mapping…")
-    edges = []  # (score, bug_idx, tms_idx, best2)
-    for i, row in jira.iterrows():
-        bug_vec = jira_emb[i]
-        bug_txt = row["__bug_text__"]
-        plat = platform_from_text(bug_txt)
-        comps = components_from_text(bug_txt)
-        bug_tags = row["__tags__"]
+    for idx, bug in jira.iterrows():
+        issue_key = str(bug["Issue key"])
+        bug_sum   = bug["_summary_"]
+        bug_text  = bug["__bug_text__"]
 
-        scores = []
-        for j in candidates_per_bug[i]:
-            cvec = tms_emb[j]
-            ctxt = tms.at[j, "__full_text__"]
+        # Platform & Components (can be multi for components)
+        platform  = platform_from_text(bug_text)
+        components = components_from_text(bug_text)
 
-            # base hybrid score
-            s = hybrid_score(bug_txt, ctxt, bug_vec, cvec, alpha=alpha)
+        picked_tms_id = None
 
-            # domain boosts
-            # tag overlap
-            overlap = len(bug_tags & tms.at[j, "__tags__"])
-            s += min(0.02 * overlap, 0.08)
+        # 1) Exact link via TMS "Jira Ticket ID" column (ground truth)
+        if TMS_JIRA and issue_key in tms_issuekey_to_ids:
+            cand_idxs = tms_issuekey_to_ids[issue_key]
+            if len(cand_idxs) == 1:
+                picked_tms_id = str(tms.at[cand_idxs[0], TMS_ID])
+            else:
+                # multiple rows reference this issue key -> pick best by fuzzy title vs summary
+                best = None
+                best_score = -1
+                for j in cand_idxs:
+                    score = fuzz.token_set_ratio(bug_sum, tms.at[j, "__title__"])
+                    if score > best_score:
+                        best_score = score
+                        best = j
+                picked_tms_id = str(tms.at[best, TMS_ID])
 
-            # folder/component hint
-            if "Folder" in tms.columns and isinstance(tms.at[j, "Folder"], str):
-                if comps:
-                    # if any component name appears in folder text, boost
-                    if any(c.strip().lower() in tms.at[j, "Folder"].lower() for c in comps.split(",")):
-                        s += 0.05
+        # 2) If still not mapped: title containment (strict but fast)
+        if picked_tms_id is None:
+            # shortlist by keywords in Folder/Labels and fuzzy on Title
+            pool = shortlist_candidates_for_bug(bug_text, tms, cap=max_candidates)
+            # title containment check inside pool
+            bug_norm = clean_text(bug_sum)
+            contains_hits = []
+            for j in pool:
+                t = tms.at[j, "__title__"].lower()
+                if bug_norm and (bug_norm in t or t in bug_norm):
+                    contains_hits.append(j)
+            if contains_hits:
+                # choose the one with best fuzzy overlap
+                best = None
+                best_score = -1
+                for j in contains_hits:
+                    score = fuzz.token_set_ratio(bug_sum, tms.at[j, "__title__"])
+                    if score > best_score:
+                        best_score, best = score, j
+                if best_score >= fuzzy_threshold:
+                    picked_tms_id = str(tms.at[best, TMS_ID])
 
-            # platform hint
-            if plat and plat.lower() in tms.at[j, "__full_text__"]:
-                s += 0.05
+        # 3) Fuzzy within candidate pool
+        if picked_tms_id is None:
+            pool = shortlist_candidates_for_bug(bug_text, tms, cap=max_candidates)
+            choices = tms.loc[pool, "__full_text__"].tolist()
+            match = process.extractOne(bug_text, choices, scorer=fuzz.token_set_ratio)
+            if match is not None:
+                best_text, score, rel_idx = match
+                if score >= fuzzy_threshold:
+                    j = pool[rel_idx]
+                    picked_tms_id = str(tms.at[j, TMS_ID])
 
-            scores.append((s, j))
+        # 4) TF-IDF cosine inside candidate pool
+        if picked_tms_id is None:
+            pool = shortlist_candidates_for_bug(bug_text, tms, cap=max_candidates)
+            # build TF-IDF only for this bug + pool
+            tfidf = TfidfVectorizer(min_df=1, ngram_range=(1,2))
+            corpus = [bug_text] + tms.loc[pool, "__full_text__"].tolist()
+            try:
+                X = tfidf.fit_transform(corpus)
+                sims = cosine_similarity(X[0:1], X[1:]).ravel()
+                best_pos = int(np.argmax(sims))
+                best_sim = float(sims[best_pos])
+                if best_sim >= tfidf_threshold:
+                    j = pool[best_pos]
+                    picked_tms_id = str(tms.at[j, TMS_ID])
+            except ValueError:
+                # empty corpus, skip
+                pass
 
-        if scores:
-            scores.sort(reverse=True, key=lambda x: x[0])
-            best, best_j = scores[0][0], scores[0][1]
-            best2 = scores[1][0] if len(scores) > 1 else 0.0
-            edges.append((best, i, best_j, best2))
+        # 5) Fallback: no match
+        if picked_tms_id is None:
+            picked_tms_id = "Test case needs to be added – no match found"
 
-    # Greedy assignment (highest score first), prevents repeated TMS IDs
-    edges.sort(reverse=True, key=lambda x: x[0])
-    assigned_bug, assigned_tms, chosen = set(), set(), {}
-    for s, bi, tj, s2 in edges:
-        if s < sim_threshold:
-            continue
-        if bi in assigned_bug or tj in assigned_tms:
-            continue
-        # Optional: ensure uniqueness by checking margin to runner-up
-        if s - s2 < 0.03:  # small margin → too ambiguous, skip
-            continue
-        assigned_bug.add(bi)
-        assigned_tms.add(tj)
-        chosen[bi] = (tj, s)
-
-    # ---- Build final output (exactly 5 columns)
-    rows = []
-    for i, row in jira.iterrows():
-        bug_txt = row["__bug_text__"]
-        plat = platform_from_text(bug_txt)
-        comps = components_from_text(bug_txt)
-
-        if i in chosen:
-            j = chosen[i][0]
-            tms_id = str(tms.at[j, tms_id_col])
-        else:
-            tms_id = "Test case needs to be added – no match found"
-
-        rows.append({
-            "Issue key": row["Issue key"],
-            "Summary": row["Summary"],
-            "TMS ID": tms_id,
-            "Component": comps,      # multiple allowed, comma-separated
-            "Platform": plat         # only one
+        results.append({
+            "Issue key": issue_key,
+            "Summary": bug_sum,
+            "TMS ID": picked_tms_id,
+            "Component": components,
+            "Platform": platform
         })
 
-    final_df = pd.DataFrame(rows, columns=["Issue key", "Summary", "TMS ID", "Component", "Platform"])
+        if (idx + 1) % 5 == 0 or idx == len(jira) - 1:
+            progress.progress((idx + 1) / len(jira),
+                              text=f"🔎 Mapping… {idx+1}/{len(jira)}")
 
-    # ---- Preview (all rows, clean)
-    st.success(f"✅ Done: { (final_df['TMS ID']!='Test case needs to be added – no match found').sum() } mapped • "
-               f"{ (final_df['TMS ID']=='Test case needs to be added – no match found').sum() } need new cases")
+    progress.empty()
+
+    final_df = pd.DataFrame(results, columns=["Issue key", "Summary", "TMS ID", "Component", "Platform"])
+
+    # Summary banner
+    mapped_cnt = (final_df["TMS ID"] != "Test case needs to be added – no match found").sum()
+    st.success(f"✅ Done • {mapped_cnt}/{len(final_df)} mapped to existing TMS • "
+               f"{len(final_df) - mapped_cnt} need new test cases")
+
+    # Full clean preview (scrollable)
     st.dataframe(final_df, use_container_width=True, height=720)
 
-    # ---- Download (exact same columns)
+    # Download
     out = BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
         final_df.to_excel(writer, index=False, sheet_name="Mapped")
