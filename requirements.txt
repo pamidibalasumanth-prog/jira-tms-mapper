@@ -5,3 +5,4 @@ scikit-learn
 rapidfuzz
 openpyxl
 xlsxwriter
+openai
