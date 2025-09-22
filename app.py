@@ -6,16 +6,16 @@ from rapidfuzz import fuzz
 from io import BytesIO
 import time
 
-# -----------------------------------
+# --------------------------
 # Streamlit Page Setup
-# -----------------------------------
+# --------------------------
 st.set_page_config(page_title="Jira ↔ TMS Mapper", layout="wide")
 st.title("Jira ↔ TMS Mapper")
 st.caption("Developed by Pamidi Bala Sumanth")
 
-# -----------------------------------
-# Step 1: API Key Input
-# -----------------------------------
+# --------------------------
+# API Key Input
+# --------------------------
 api_key = st.text_input("🔑 Enter your OpenAI API key", type="password")
 
 if not api_key:
@@ -24,133 +24,110 @@ if not api_key:
 
 client = OpenAI(api_key=api_key)
 
-# -----------------------------------
+# --------------------------
 # Helper Functions
-# -----------------------------------
+# --------------------------
 def get_embeddings_batched(texts, client, model="text-embedding-3-small", batch_size=100):
-    """Batch embedding with progress bar"""
     embeddings = []
     progress = st.progress(0)
     status = st.empty()
-
     total = len(texts)
+
     for i in range(0, total, batch_size):
         batch = texts[i:i+batch_size]
-
         try:
             response = client.embeddings.create(model=model, input=batch)
             for emb in response.data:
                 embeddings.append(emb.embedding)
         except Exception as e:
-            st.error(f"Embedding error at batch {i//batch_size}: {e}")
-            for _ in batch:
-                embeddings.append([0.0] * 1536)
-
-        # Update progress
+            st.error(f"Embedding error: {e}")
+            embeddings.extend([[0.0]*1536]*len(batch))
         done = min(i+batch_size, total)
         progress.progress(done/total)
-        status.text(f"Processed {done}/{total} rows...")
-
-        time.sleep(0.2)  # slight delay for rate limits
-
+        status.text(f"Processed {done}/{total}")
+        time.sleep(0.2)
     progress.empty()
     status.text("✅ Embeddings ready!")
     return np.array(embeddings)
 
-
-def cosine_similarity(vec1, vec2):
-    v1, v2 = np.array(vec1), np.array(vec2)
+def cosine_similarity(v1, v2):
+    v1, v2 = np.array(v1), np.array(v2)
     return float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-10))
 
+def assign_component(summary):
+    summary = summary.lower()
+    if "salesforce" in summary: return "SalesForce"
+    if "sap" in summary: return "SAP"
+    if "recorder" in summary: return "Recorder (Browser)"
+    if "user" in summary: return "User Management"
+    return "General"
 
-def hybrid_similarity(text1, text2, emb1, emb2, alpha=0.7):
-    """Combine embeddings (semantic) + fuzzy ratio (literal match)"""
-    cos_sim = cosine_similarity(emb1, emb2)
-    fuzz_score = fuzz.token_sort_ratio(text1, text2) / 100
-    return alpha * cos_sim + (1 - alpha) * fuzz_score
+def assign_platform(summary):
+    summary = summary.lower()
+    if "android" in summary: return "Android"
+    if "ios" in summary: return "iOS"
+    if "windows" in summary: return "Windows"
+    if "mac" in summary: return "Mac"
+    return "Web"
 
-
-# -----------------------------------
+# --------------------------
 # File Uploads
-# -----------------------------------
+# --------------------------
 jira_file = st.file_uploader("📂 Upload Jira C List (CSV/XLSX)", type=["csv", "xlsx"])
 tms_file = st.file_uploader("📂 Upload TMS Export (Excel)", type=["xlsx"])
 threshold = st.slider("🎯 Similarity threshold", 0.0, 1.0, 0.65, 0.01)
 
-# -----------------------------------
+# --------------------------
 # Processing
-# -----------------------------------
+# --------------------------
 if jira_file and tms_file:
-    # Load Jira
     if jira_file.name.endswith(".csv"):
         jira = pd.read_csv(jira_file)
     else:
         jira = pd.read_excel(jira_file)
-
-    # Load TMS
     tms = pd.read_excel(tms_file)
 
-    # Prepare text fields
-    jira["__bug_text__"] = jira["Summary"].fillna("") + " " + jira.get("Description", "").fillna("")
+    jira["__bug_text__"] = jira["Summary"].fillna("")
     tms["__case_text__"] = tms["Title"].fillna("") + " " + tms["Description"].fillna("")
 
-    # Generate embeddings
-    st.info("⏳ Generating embeddings for Jira bugs...")
+    st.info("⏳ Embedding Jira bugs...")
     jira_embs = get_embeddings_batched(jira["__bug_text__"].tolist(), client)
 
-    st.info("⏳ Generating embeddings for TMS cases (this may take longer)...")
+    st.info("⏳ Embedding TMS cases...")
     tms_embs = get_embeddings_batched(tms["__case_text__"].tolist(), client)
 
-    # Perform matching
-    mappings = []
-    progress = st.progress(0)
-    status = st.empty()
-
+    results = []
     for i, bug in jira.iterrows():
         bug_text = bug["__bug_text__"]
         bug_emb = jira_embs[i]
 
         best_score, best_case = -1, None
-
         for j, case in tms.iterrows():
-            score = hybrid_similarity(bug_text, case["__case_text__"], bug_emb, tms_embs[j])
+            score = cosine_similarity(bug_emb, tms_embs[j])
             if score > best_score:
                 best_score, best_case = score, case
 
         if best_score >= threshold and best_case is not None:
-            mappings.append({
-                **bug.to_dict(),
-                "TMS ID": best_case["ID"],
-                "TMS Folder Name": best_case.get("Folder", ""),
-                "Similarity Score": round(best_score, 4),
-                "Component": bug.get("Component", ""),
-                "Platform": bug.get("Platform", "")
-            })
+            tms_id = best_case["ID"]
         else:
-            mappings.append({
-                **bug.to_dict(),
-                "TMS ID": "❌ Test case needs to be added",
-                "TMS Folder Name": "New",
-                "Similarity Score": round(best_score, 4),
-                "Component": bug.get("Component", ""),
-                "Platform": bug.get("Platform", "")
-            })
+            tms_id = "❌ Test case needs to be added"
 
-        progress.progress((i+1)/len(jira))
-        status.text(f"Matched {i+1}/{len(jira)} Jira bugs")
+        results.append({
+            "Issue key": bug["Issue key"],
+            "Summary": bug["Summary"],
+            "TMS ID": tms_id,
+            "Component": assign_component(bug["Summary"]),
+            "Platform": assign_platform(bug["Summary"])
+        })
 
-    progress.empty()
-    status.text("✅ Mapping complete!")
+    final_df = pd.DataFrame(results)
 
-    mapped_df = pd.DataFrame(mappings)
+    st.success("✅ Mapping complete!")
+    st.dataframe(final_df, use_container_width=True)
 
-    # Show all rows
-    st.write(mapped_df.to_html(escape=False, index=False), unsafe_allow_html=True)
-
-    # Download Excel
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        mapped_df.to_excel(writer, index=False, sheet_name="Mapped")
+        final_df.to_excel(writer, index=False, sheet_name="Mapped")
     st.download_button(
         "📥 Download Excel",
         data=output.getvalue(),
