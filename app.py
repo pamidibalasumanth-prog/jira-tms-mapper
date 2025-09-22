@@ -5,12 +5,14 @@ from io import BytesIO
 from sklearn.metrics.pairwise import cosine_similarity
 from openai import OpenAI
 import os
+import hashlib
+import pickle
 
 # ---------------------------
 # App Header
 # ---------------------------
-st.title("Jira ↔ TMS Semantic Mapper")
-st.caption("Developed by Pamidi Bala Sumanth (AI-powered)")
+st.title("Jira ↔ TMS Semantic Mapper (Optimized)")
+st.caption("Developed by Pamidi Bala Sumanth – AI-powered with caching")
 
 # ---------------------------
 # OpenAI API Key
@@ -35,7 +37,7 @@ tms_file  = st.file_uploader("Upload TMS Export (Excel)", type=["xlsx"])
 threshold = st.slider("Select similarity threshold (cosine)", 0.0, 1.0, 0.70, 0.01)
 
 # ---------------------------
-# Keyword-based platform and component mapping
+# Platform & Component Mapping
 # ---------------------------
 platform_keywords = {
     "mobile": "Mobile",
@@ -87,16 +89,38 @@ def components_from_text(text):
     return ", ".join(sorted(set(comps)))
 
 # ---------------------------
-# Get embeddings with v1 API
+# Caching helper
 # ---------------------------
-def get_embedding(text, model="text-embedding-3-small"):
-    if not text or not isinstance(text, str) or not text.strip():
-        return None
-    emb = client.embeddings.create(
-        model=model,
-        input=text
-    )
-    return np.array(emb.data[0].embedding)
+def cache_key(texts, model):
+    concat = "|".join(texts)
+    return hashlib.md5((concat + model).encode("utf-8")).hexdigest()
+
+def load_cached_embeddings(key):
+    fname = f"cache_{key}.pkl"
+    if os.path.exists(fname):
+        with open(fname, "rb") as f:
+            return pickle.load(f)
+    return None
+
+def save_cached_embeddings(key, embs):
+    fname = f"cache_{key}.pkl"
+    with open(fname, "wb") as f:
+        pickle.dump(embs, f)
+
+# ---------------------------
+# Batch embedding
+# ---------------------------
+def get_embeddings(texts, model="text-embedding-3-small"):
+    key = cache_key(texts, model)
+    cached = load_cached_embeddings(key)
+    if cached is not None:
+        return cached
+
+    emb = client.embeddings.create(model=model, input=texts)
+    vectors = [np.array(r.embedding) for r in emb.data]
+
+    save_cached_embeddings(key, vectors)
+    return vectors
 
 # ---------------------------
 # Main
@@ -120,24 +144,15 @@ if jira_file and tms_file and client:
         tms.get("Expected Results","").fillna("").astype(str)
     )
 
-    # Compute embeddings with progress bar
-    progress = st.progress(0, text="🔄 Generating embeddings...")
+    # Embedding in 2 calls
+    with st.spinner("🔄 Generating embeddings (cached if possible)..."):
+        jira_embs = get_embeddings(jira["__bug_text__"].tolist())
+        tms_embs  = get_embeddings(tms["__full_text__"].tolist())
 
-    jira_embs, tms_embs = [], []
-    for i, txt in enumerate(jira["__bug_text__"]):
-        jira_embs.append(get_embedding(txt))
-        progress.progress(int((i+1)/len(jira)*50), text="🔄 Embedding Jira bugs...")
+    jira_embs = np.vstack(jira_embs)
+    tms_embs = np.vstack(tms_embs)
 
-    for i, txt in enumerate(tms["__full_text__"]):
-        tms_embs.append(get_embedding(txt))
-        progress.progress(50 + int((i+1)/len(tms)*50), text="🔄 Embedding TMS cases...")
-
-    progress.empty()
-
-    jira_embs = np.vstack([e for e in jira_embs if e is not None])
-    tms_embs = np.vstack([e for e in tms_embs if e is not None])
-
-    # Compute similarity matrix
+    # Similarity
     sim_matrix = cosine_similarity(jira_embs, tms_embs)
 
     # One-to-one greedy assignment
