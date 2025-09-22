@@ -3,9 +3,8 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 from sklearn.metrics.pairwise import cosine_similarity
-import openai
+from openai import OpenAI
 import os
-import re
 
 # ---------------------------
 # App Header
@@ -18,9 +17,11 @@ st.caption("Developed by Pamidi Bala Sumanth (AI-powered)")
 # ---------------------------
 api_key = st.text_input("Enter your OpenAI API key", type="password")
 if api_key:
-    openai.api_key = api_key
+    client = OpenAI(api_key=api_key)
 elif os.getenv("OPENAI_API_KEY"):
-    openai.api_key = os.getenv("OPENAI_API_KEY")
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+else:
+    client = None
 
 # ---------------------------
 # File Uploads
@@ -86,21 +87,21 @@ def components_from_text(text):
     return ", ".join(sorted(set(comps)))
 
 # ---------------------------
-# Get embeddings
+# Get embeddings with v1 API
 # ---------------------------
 def get_embedding(text, model="text-embedding-3-small"):
     if not text or not isinstance(text, str) or not text.strip():
         return None
-    result = openai.Embedding.create(
-        input=text,
-        model=model
+    emb = client.embeddings.create(
+        model=model,
+        input=text
     )
-    return np.array(result['data'][0]['embedding'])
+    return np.array(emb.data[0].embedding)
 
 # ---------------------------
 # Main
 # ---------------------------
-if jira_file and tms_file and openai.api_key:
+if jira_file and tms_file and client:
     # Load Jira
     jira = pd.read_csv(jira_file) if jira_file.name.endswith(".csv") else pd.read_excel(jira_file)
     jira["__bug_text__"] = (jira.get("Summary","").fillna("").astype(str) + " " +
